@@ -1,0 +1,969 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Jumpscore</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #15171d; overflow: hidden; touch-action: none; user-select: none; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ---------- tuning ----------
+const BPM = 100, BEAT = 60 / BPM, STEP = BEAT / 4, BAR = BEAT * 4;
+const TOTAL_BARS = 40;            // song length (~96s)
+const SPEED = 260;                // world scroll, px per second
+const GRAV = 2200, FALL_GRAV = 1.4;
+const HANG_V = 140, HANG_GRAV = 0.5;   // near the top of an arc gravity softens: a brief hang to aim
+// every launch has a small fixed impulse; holding keeps that speed for up to HOLD_TIME (variable height)
+const JUMP_V = 620, BOUNCE_V = 640, CHAIN_BOOST = 12, AIR_JUMP_V = 500, HOLD_TIME = 0.18;
+const DIVE_V = 1100;              // air press with a shape below: drop fast into it
+const BACK_REACH = 36;            // a dive may slide the player this far back to catch a shape just passed
+const STEER_V = 700, RETURN_V = 160;   // px/s: sliding toward a dive target, and drifting back afterwards
+const PERFECT_WIN = 0.07;         // seconds from the shape's beat that count as "perfect"
+const PERFECT_BOUNCE = 1.12, SLAM_BOUNCE = 1.35, GRACE_V = 420;
+const MAGNET = 22;                // extra reach within which the player is pulled toward a shape
+const HITSTOP = 0.05;
+const LEVEL_BASE = 90, LEVEL_GAP = 60, MAX_LEVEL = 9;
+const PLAYER_H = 44, SHAPE_R = 24, GRACE_R = 11, GRACE_H = 80, NPTS = 48;
+const GROUND_F = 0.78;            // ground line position (fraction of screen height)
+
+// ---------- palette (soft, low-contrast-but-readable) ----------
+const LINE = '#aeb7c4';
+const lineA = a => `rgba(174,183,196,${a})`;
+const FLASH = '#e3e8ef';
+const HUES = [205, 180, 150, 100, 50, 25, 350, 315, 280, 240];
+const SIDES = [3, 4, 5, 6, 8, 3, 4, 5, 6, 8];   // circles are reserved for held notes
+const shapeCol = (lvl, a = 1) => `hsla(${HUES[lvl % HUES.length]},30%,74%,${a})`;
+
+// ---------- canvas ----------
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H, S, DPR, PX, GY;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = innerWidth * DPR; cv.height = innerHeight * DPR;
+  S = Math.max(0.55, Math.min(innerWidth / 1000, innerHeight / 640, 1.4));
+  W = innerWidth / S; H = innerHeight / S;
+  PX = Math.max(110, W * 0.24);
+  GY = H * GROUND_F;
+}
+addEventListener('resize', resize); resize();
+
+// ---------- utils ----------
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const ease = x => 1 - Math.pow(1 - clamp(x, 0, 1), 3);
+const NOTE = n => 440 * Math.pow(2, (n - 69) / 12);
+const pc = o => ((o % 12) + 12) % 12;
+function rngFrom(seed) {
+  return () => {
+    seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function loadBest() { try { return +localStorage.getItem('jumpscore.best') || 0; } catch (e) { return 0; } }
+function saveBest(v) { try { localStorage.setItem('jumpscore.best', String(v)); } catch (e) {} }
+
+// ---------- audio ----------
+let ac, master, revSend, delaySend, noiseBuf, analyser, waveBuf;
+function initAudio() {
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3;
+  master = ac.createGain(); master.gain.value = 0.85;
+  master.connect(comp).connect(ac.destination);
+  analyser = ac.createAnalyser(); analyser.fftSize = 2048;
+  waveBuf = new Float32Array(analyser.fftSize);
+  comp.connect(analyser);
+
+  // generated reverb impulse
+  const len = ac.sampleRate * 2.8, ir = ac.createBuffer(2, len, ac.sampleRate);
+  for (let c = 0; c < 2; c++) {
+    const d = ir.getChannelData(c);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
+  }
+  const rev = ac.createConvolver(); rev.buffer = ir;
+  revSend = ac.createGain(); revSend.gain.value = 0.3;
+  revSend.connect(rev).connect(master);
+
+  // dotted-eighth feedback delay
+  const dl = ac.createDelay(2); dl.delayTime.value = BEAT * 0.75;
+  const fb = ac.createGain(); fb.gain.value = 0.33;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2400;
+  delaySend = ac.createGain(); delaySend.gain.value = 0.22;
+  delaySend.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(master); lp.connect(revSend);
+
+  noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+  const nd = noiseBuf.getChannelData(0);
+  for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+}
+
+function osc(type, freq, t, dur, dest) {
+  const o = ac.createOscillator();
+  o.type = type; o.frequency.setValueAtTime(freq, t);
+  o.connect(dest); o.start(t); o.stop(t + dur + 0.05);
+  return o;
+}
+function pad(notes, t, dur) {
+  const g = ac.createGain(), f = ac.createBiquadFilter();
+  f.type = 'lowpass'; f.Q.value = 0.4;
+  f.frequency.setValueAtTime(600, t);
+  f.frequency.linearRampToValueAtTime(1200, t + dur * 0.5);
+  f.frequency.linearRampToValueAtTime(700, t + dur);
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(0.022, t + 0.6);
+  g.gain.setValueAtTime(0.022, t + dur - 0.1);
+  g.gain.linearRampToValueAtTime(0, t + dur + 0.7);
+  g.connect(f); f.connect(master); f.connect(revSend);
+  for (const n of notes) for (const dt of [-8, 8]) osc('sawtooth', NOTE(n), t, dur + 0.8, g).detune.value = dt;
+}
+function bass(n, t, dur, v = 0.24) {
+  const g = ac.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(v, t + 0.01);
+  g.gain.setValueAtTime(v, t + dur * 0.6);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  g.connect(master);
+  osc('sine', NOTE(n), t, dur, g);
+  const g2 = ac.createGain(); g2.gain.value = 0.2; g2.connect(g);
+  osc('triangle', NOTE(n), t, dur, g2);
+}
+function kick(t, v = 0.5) {
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.frequency.setValueAtTime(130, t);
+  o.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+  g.gain.setValueAtTime(v, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+  o.connect(g).connect(master); o.start(t); o.stop(t + 0.4);
+}
+function noise(t, dur, type, freq, q, v, toRev) {
+  const s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+  s.buffer = noiseBuf; f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(v, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  s.connect(f).connect(g).connect(master);
+  if (toRev) g.connect(revSend);
+  s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.02);
+}
+function snare(t) {
+  noise(t, 0.18, 'bandpass', 1900, 0.8, 0.13, true);
+  const g = ac.createGain();
+  g.gain.setValueAtTime(0.08, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.1);
+  g.connect(master); osc('triangle', 190, t, 0.1, g);
+}
+function pluck(n, t, v = 0.045) {
+  const f = ac.createBiquadFilter(), g = ac.createGain();
+  f.type = 'lowpass';
+  f.frequency.setValueAtTime(2600, t); f.frequency.exponentialRampToValueAtTime(450, t + 0.25);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(v, t + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+  osc('sawtooth', NOTE(n), t, 0.32, f);
+  f.connect(g); g.connect(master); g.connect(delaySend);
+}
+// bright: 0..1+, more upper partials (longer chains and perfect hits ring brighter)
+function bell(n, t, v = 0.22, bright = 0) {
+  const f0 = NOTE(n), g = ac.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(v, t + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 1.6);
+  g.connect(master); g.connect(revSend); g.connect(delaySend);
+  osc('sine', f0, t, 1.7, g);
+  const g2 = ac.createGain();
+  g2.gain.setValueAtTime(0.35 + 0.25 * bright, t); g2.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+  g2.connect(g); osc('sine', f0 * 2, t, 0.6, g2);
+  const g3 = ac.createGain();
+  g3.gain.setValueAtTime(0.12 + 0.15 * bright, t); g3.gain.exponentialRampToValueAtTime(0.001, t + 0.18 + 0.1 * bright);
+  g3.connect(g); osc('sine', f0 * 3.01, t, 0.3, g3);
+}
+// sustained note for held (circle) shapes; returns its gain so an early release can fade it
+function hum(n, t, dur, v) {
+  const f0 = NOTE(n), g = ac.createGain(), lfo = ac.createOscillator(), lg = ac.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(v, t + 0.02);
+  g.gain.setValueAtTime(v, t + dur);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.5);
+  g.connect(master); g.connect(revSend);
+  lfo.frequency.value = 5.5; lg.gain.value = 7; lfo.connect(lg);
+  for (const [type, mul, gain] of [['sine', 1, 1], ['triangle', 2, 0.22]]) {
+    const gg = ac.createGain(); gg.gain.value = gain; gg.connect(g);
+    lg.connect(osc(type, f0 * mul, t, dur + 0.55, gg).detune);
+  }
+  lfo.start(t); lfo.stop(t + dur + 0.6);
+  return g;
+}
+function ting(n, t, v = 0.09) {
+  const g = ac.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(v, t + 0.004);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+  g.connect(master); g.connect(delaySend);
+  osc('sine', NOTE(n), t, 0.32, g);
+  const g2 = ac.createGain(); g2.gain.value = 0.3; g2.connect(g);
+  osc('triangle', NOTE(n) * 2, t, 0.32, g2);
+}
+function thump(t, f0, v) {
+  const g = ac.createGain(), o = ac.createOscillator();
+  o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f0 * 0.55, t + 0.08);
+  g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.1);
+  o.connect(g).connect(master); o.start(t); o.stop(t + 0.12);
+}
+
+// ---------- song ----------
+// Diatonic seventh chords as semitone offsets from the (minor) key root.
+const CH = { i: [0, 3, 7, 10], iv: [5, 8, 12, 15], v: [7, 10, 14, 17], III: [3, 7, 10, 14], VI: [8, 12, 15, 19], VII: [10, 14, 17, 20] };
+const PROGS = [
+  [CH.i, CH.VI, CH.III, CH.VII],
+  [CH.i, CH.iv, CH.VI, CH.v],
+  [CH.i, CH.VII, CH.VI, CH.VII],
+  [CH.VI, CH.VII, CH.i, CH.i],
+];
+const KEYS = [48, 50, 52, 53];
+let song = null;
+// 0..4: how many layers of the band are playing; earned by hitting shapes, lost by landing or missing
+let energy = 0;
+
+function chordAt(bar) {
+  if (bar >= TOTAL_BARS - 1) return CH.i;
+  return song.prog[((bar % 4) + 4) % 4];
+}
+const padNote = o => song.key + 7 + pc(pc(o) - 7);
+const bassNote = o => song.key - 12 + pc(o) - (pc(o) > 6 ? 12 : 0);
+// Chord tones stacked upward: index = shape level, so higher shapes = higher notes, always in harmony.
+function chordTones(bar) {
+  const pcs = [...new Set(chordAt(bar).map(pc))].sort((a, b) => a - b), out = [];
+  for (let oc = 0; oc < 4; oc++) for (const p of pcs) out.push(song.key + 12 + oc * 12 + p);
+  return out;
+}
+// When to play a hit's note: on the next 32nd of the song grid, so it always lands in time.
+function snapTime() {
+  const now = ac.currentTime, g = STEP / 2;
+  const t = song.start + Math.ceil((now - song.start - 0.02) / g) * g;
+  return Math.max(t, now + 0.005);
+}
+
+const BASS_PAT = { 0: 0, 6: 0, 8: 7, 10: 0, 14: 12 };
+const ARP = [0, 1, 2, 3, 4, 3, 2, 1];
+function scheduleStep(step, t) {
+  const bar = Math.floor(step / 16), s = step % 16;
+  if (bar >= TOTAL_BARS) return;
+  const ch = chordAt(bar), last = bar === TOTAL_BARS - 1;
+  const calm = bar < 4 || bar >= 36;              // intro and outro stay sparse
+  const L = calm ? 0 : Math.floor(energy);         // layers: 1 bass groove, 2 kick+hats, 3 snare, 4 arpeggio
+  const root = bassNote(ch[0]);
+
+  if (s === 0) pad(ch.map(padNote), t, last ? BAR * 1.1 : BAR);
+
+  if (L >= 1) { if (s in BASS_PAT) bass(root + BASS_PAT[s], t, STEP * 1.8); }
+  else if (s === 0) bass(root, t, last ? BAR * 1.1 : BAR * 0.95, 0.2);
+
+  if (L >= 2) {
+    if (s === 0 || s === 8 || (L >= 3 && s === 10 && bar % 2)) kick(t);
+    if (s % 4 === 2) noise(t, 0.05, 'highpass', 7000, 0.7, 0.065);
+    if (L >= 3 && s % 4 === 0) noise(t, 0.05, 'highpass', 7000, 0.7, 0.03);
+  }
+  if (L >= 3 && (s === 4 || s === 12)) snare(t);
+  if (L >= 4) {
+    const tones = chordTones(bar), dense = bar >= 24 && bar < 32;
+    if (dense || s % 2 === 0) pluck(tones[ARP[(dense ? s : s / 2) % 8]], t, dense && s % 2 ? 0.028 : 0.045);
+  }
+  if (last && s === 0) bell(song.key + 24, t + 0.02, 0.12);
+}
+function scheduler() {
+  if (!song || !ac) return;
+  while (song.nextT < ac.currentTime + 0.12) {
+    scheduleStep(song.step, song.nextT);
+    song.step++;
+    song.nextT = song.start + song.step * STEP;
+  }
+}
+setInterval(scheduler, 25);
+
+// ---------- level generation: melodic phrases (up, down, repeated notes) on a 16th grid ----------
+const levelH = l => LEVEL_BASE + l * LEVEL_GAP;
+// Height gained t seconds after a bounce: holding the full boost (highest) or releasing at once (lowest).
+function riseAt(t, v, hold) {
+  if (hold) return t < HOLD_TIME ? v * t : v * HOLD_TIME + riseAt(t - HOLD_TIME, v, false);
+  const tp = v / GRAV;
+  if (t <= tp) return v * t - GRAV * t * t / 2;
+  return v * tp / 2 - GRAV * FALL_GRAV * (t - tp) ** 2 / 2;
+}
+const GAP_CHOICES = [4, 6, 3, 8, 5, 2];   // in 16ths, most musical first
+// Pick a gap after which a shape at level `to` is reachable by bouncing off `from` (no air jump needed).
+function gapFor(from, to, rng) {
+  const b0 = levelH(from) - 40, c = levelH(to), v = BOUNCE_V + CHAIN_BOOST * 2;
+  const ok = GAP_CHOICES.filter(k => {
+    const t = k * STEP;
+    return b0 + riseAt(t, v, true) >= c - 60 && b0 + riseAt(t, v, false) <= c + 16;
+  });
+  if (!ok.length) return 0;
+  return ok.length > 1 && rng() < 0.25 ? ok[1] : ok[0];
+}
+const INTERVALS = [-2, -1, -1, 0, 0, 1, 1, 1, 2, 2];
+// kinds: note (bounce), hold (circle you ride for a beat), chord (two stacked notes), grace (small low hop)
+function genShapes(rng) {
+  const out = [], end = Math.floor((TOTAL_BARS * BAR - 2) / STEP);   // shapes until 2s before the song ends
+  let ph = 0;
+  const add = (step, l, kind = 'note') => out.push({
+    t: step * STEP, level: l, kind, ph, sides: kind === 'hold' ? 0 : SIDES[l], len: kind === 'hold' ? BEAT : 0,
+    phase: rng() * 6.28, spin: (rng() < 0.5 ? -1 : 1) * (0.5 + rng() * 0.6), hit: false, hitT: 0, missed: false,
+  });
+  const kindFor = (l, prog) => {
+    const r = rng();
+    if (r < 0.1 + prog * 0.06) return 'hold';
+    if (r < 0.2 + prog * 0.08 && l < MAX_LEVEL) return 'chord';
+    return 'note';
+  };
+  let s = 32;
+  while (s < end) {
+    const prog = s / end;
+    ph++;
+    if (rng() < 0.2) { add(s, Math.floor(rng() * 2)); s += 8; continue; }
+    // a short motif, then the motif again (sometimes inverted) — call and answer
+    const motif = Array.from({ length: 2 + Math.floor(rng() * 3) }, () => INTERVALS[Math.floor(rng() * INTERVALS.length)]);
+    const steps = motif.concat(rng() < 0.5 ? motif : motif.map(x => -x));
+    let l = Math.floor(rng() * (2 + prog * 2)), kind = 'note';
+    add(s, l);
+    for (const iv of steps) {
+      let nl = l + iv + (rng() < 0.1 + prog * 0.2 ? 1 : 0);
+      if (nl < 0 || nl > MAX_LEVEL) nl = l - iv;
+      nl = clamp(nl, 0, MAX_LEVEL);
+      const held = kind === 'hold' ? 4 : 0;   // a held note releases you one beat later
+      const k = gapFor(l, nl, rng);
+      if (!k || s + held + k >= end) break;
+      s += held + k; kind = kindFor(nl, prog); add(s, nl, kind); l = nl;
+    }
+    if (kind === 'hold') s += 4;
+    // grace notes in the rest: quick low hops on eighths
+    let g = s + 6;
+    if (rng() < 0.45) {
+      const n = 2 + Math.floor(rng() * 3);
+      for (let i = 0; i < n && g < end; i++, g += 2) {
+        out.push({ t: g * STEP, level: 0, kind: 'grace', ph: -1, gi: i, sides: 4, len: 0, phase: Math.PI / 4, spin: 0, hit: false, hitT: 0, missed: false });
+      }
+    }
+    s = Math.ceil((Math.max(s + 8, g + 4) + rng() * 8) / 4) * 4;   // rest, then start the next phrase on a beat
+  }
+  return out;
+}
+const shapeH = (sh, t) => sh.kind === 'grace' ? GRACE_H + Math.sin(t * 3 + sh.t) * 3 : levelH(sh.level) + Math.sin(t * 2 + sh.phase) * 6;
+
+// ---------- outlines (everything is a closed loop of NPTS points so it can morph) ----------
+function outlinePts(sides, r, rot, cx, cy, out) {
+  for (let i = 0; i < NPTS; i++) {
+    const u = i / NPTS;
+    if (!sides) {
+      const a = Math.PI / 2 + rot + u * Math.PI * 2;
+      out[i * 2] = cx + Math.cos(a) * r; out[i * 2 + 1] = cy + Math.sin(a) * r;
+      continue;
+    }
+    const f = u * sides, k = Math.floor(f), fr = f - k;
+    const a0 = Math.PI / 2 + rot + k / sides * Math.PI * 2, a1 = a0 + Math.PI * 2 / sides;
+    out[i * 2] = cx + (Math.cos(a0) * (1 - fr) + Math.cos(a1) * fr) * r;
+    out[i * 2 + 1] = cy + (Math.sin(a0) * (1 - fr) + Math.sin(a1) * fr) * r;
+  }
+  return out;
+}
+// The player's line is the same loop collapsed onto a vertical segment (up, then back down).
+function linePts(h, out) {
+  for (let i = 0; i < NPTS; i++) {
+    const u = i / NPTS, p = u < 0.5 ? u * 2 : 2 - u * 2;
+    out[i * 2] = 0; out[i * 2 + 1] = -p * h;
+  }
+  return out;
+}
+function strokeLoop(pts, ox, oy, col, lw) {
+  ctx.beginPath();
+  ctx.moveTo(ox + pts[0], oy + pts[1]);
+  for (let i = 1; i < NPTS; i++) ctx.lineTo(ox + pts[i * 2], oy + pts[i * 2 + 1]);
+  ctx.closePath();
+  ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke();
+}
+function dot(x, y, r, col) { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+function dotted(x0, y0, x1, y1, gap, col, skip0 = 0, skip1 = 0) {
+  const dx = x1 - x0, dy = y1 - y0, L = Math.hypot(dx, dy);
+  ctx.fillStyle = col;
+  for (let d = skip0 + 4; d < L - skip1 - 4; d += gap) ctx.fillRect(x0 + dx * d / L - 0.8, y0 + dy * d / L - 0.8, 1.6, 1.6);
+}
+
+// ---------- game state ----------
+let state = 'title', songT = 0, idleT = 0, endT = 0, camH = 0;
+// wt = world time: song time minus a small lag that hit-stop adds and then catches up
+let wt = 0, lag = 0, hitStop = 0, camKick = 0;
+let shapes = [], ripples = [], parts = [], pops = [], trails = [];
+let score = 0, best = loadBest(), newBest = false, stats = null;
+const input = { held: false };
+// background tint follows the last shape hit
+const BG_BASE = { h: 225, s: 14, l: 10 };
+const bg = { ...BG_BASE }, bgTarget = { ...BG_BASE };
+const bgCol = (a = 1) => `hsla(${bg.h},${bg.s}%,${bg.l}%,${a})`;
+const PLAYER_RESET = { h: 0, vy: 0, ground: true, airJump: true, boost: 0, diving: false, ride: null, hint: null, diveSh: null, bufMode: 'smart', dx: 0, flash: 0,
+  chain: 0, jumpBuf: 0, sq: 1, rot: 0, spin: 0, form: null, m: 1 };
+const player = { ...PLAYER_RESET, pts: new Float32Array(NPTS * 2), from: new Float32Array(NPTS * 2), tgt: new Float32Array(NPTS * 2) };
+linePts(PLAYER_H, player.pts);
+
+const stars = Array.from({ length: 80 }, () => ({ x: Math.random(), y: Math.random(), r: Math.random() * 1.1 + 0.4, a: Math.random() * 0.25 + 0.06 }));
+
+function morphTo(form) {
+  player.from.set(player.pts);
+  player.form = form; player.m = 0;
+}
+function resetPlayer() {
+  Object.assign(player, PLAYER_RESET);
+  linePts(PLAYER_H, player.pts);
+}
+
+function startGame() {
+  if (!ac) initAudio();
+  if (ac.state === 'suspended') ac.resume();
+  const rng = rngFrom((Math.random() * 1e9) | 0);
+  song = { key: KEYS[Math.floor(rng() * KEYS.length)], prog: PROGS[Math.floor(rng() * PROGS.length)], start: ac.currentTime + 0.15, step: 0 };
+  song.nextT = song.start;
+  shapes = genShapes(rng);
+  ripples = []; parts = []; pops = []; trails = [];
+  score = 0; newBest = false; energy = 0;
+  stats = { hits: 0, total: shapes.length, perfect: 0, chain: 0, top: -1 };
+  Object.assign(bgTarget, BG_BASE);
+  resetPlayer(); camH = 0; songT = wt = -0.15; lag = hitStop = camKick = 0; state = 'play';
+}
+function endGame() {
+  state = 'end'; endT = 0;
+  if (score > best) { best = score; newBest = true; saveBest(best); }
+}
+
+// ---------- input ----------
+// mode: 'smart' (space, click, tap: dive if it would catch a shape, else jump), 'up' (always jump), 'down' (always dive)
+function press(mode = 'smart') {
+  if (state === 'title') { startGame(); return; }
+  if (state === 'end') { if (endT > 1.2) startGame(); return; }
+  input.held = true; player.jumpBuf = 0.12; player.bufMode = mode;
+}
+function release() { input.held = false; }
+const KEY_MODES = { Space: 'smart', Enter: 'smart', KeyZ: 'smart', ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down' };
+addEventListener('keydown', e => { const m = KEY_MODES[e.code]; if (m) { e.preventDefault(); if (!e.repeat) press(m); } });
+addEventListener('keyup', e => { if (KEY_MODES[e.code]) release(); });
+cv.addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+addEventListener('pointerup', release);
+addEventListener('pointercancel', release);
+document.addEventListener('visibilitychange', () => {
+  if (!ac) return;
+  if (document.hidden) ac.suspend(); else if (state === 'play') ac.resume();
+});
+
+// ---------- effects ----------
+function burst(x, h, n, col, spd) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, v = spd * (0.4 + Math.random() * 0.6);
+    parts.push({ x, h, vx: Math.cos(a) * v, vh: Math.sin(a) * v, life: 0.5 + Math.random() * 0.4, age: 0, col });
+  }
+}
+function pop(x, h, text, col) { pops.push({ x, h, text, age: 0, col }); }
+
+function hitShape(sh, sx, shH) {
+  sh.hit = true; sh.hitT = 0; sh.hx = sx; sh.hh = shH;
+  const p = player;
+  const perfect = Math.abs(wt - sh.t) <= PERFECT_WIN;
+  const slam = p.diving && sh.kind !== 'grace';
+  p.chain++;
+  const c = Math.min(p.chain, 8);
+  const tones = chordTones(clamp(Math.floor(songT / BAR), 0, TOTAL_BARS - 1));
+  const tn = snapTime();
+  stats.hits++; stats.chain = Math.max(stats.chain, p.chain);
+  if (perfect) stats.perfect++;
+  p.ground = false; p.airJump = true; p.diving = false;
+
+  if (sh.kind === 'grace') {
+    ting(tones[4 + sh.gi % 3], tn, 0.09 * (perfect ? 1.3 : 1));
+    const gained = 5 * p.chain * (perfect ? 2 : 1);
+    score += gained;
+    energy = Math.min(4, energy + 0.25);
+    p.vy = GRACE_V; p.boost = 0; p.sq = 1.2; p.flash = perfect ? 0.6 : 0;
+    burst(sx, shH, 6, lineA(0.8), 110);
+    pop(sx, shH + 20, (perfect ? 'perfect +' : '+') + gained, lineA(1));
+    return;
+  }
+
+  const vol = 0.2 * (1 - sh.level * 0.04) * (1 + c * 0.04) * (perfect ? 1.2 : 1);
+  const bright = c / 8 + (perfect ? 0.5 : 0);
+  bell(tones[sh.level], tn, sh.kind === 'hold' ? vol * 0.5 : vol, bright);
+  if (sh.kind === 'chord') bell(tones[sh.level + 1], tn + 0.012, vol * 0.85, bright);
+  if (perfect) bell(tones[sh.level] + 12, tn + 0.02, vol * 0.25);
+  if (slam) bell(tones[sh.level] - 12, tn, vol * 0.9, 0.3);
+
+  let gained = (10 + sh.level * 5) * p.chain;
+  if (perfect) gained *= 2;
+  if (sh.kind === 'chord') gained *= 1.5;
+  if (slam) gained *= 1.5;
+  gained = Math.round(gained);
+  score += gained;
+  stats.top = Math.max(stats.top, sh.level + (sh.kind === 'chord' ? 1 : 0));
+  energy = Math.min(4, energy + (perfect ? 1 : 0.5) + (slam ? 0.5 : 0));
+
+  p.vy = (BOUNCE_V + Math.min(p.chain, 6) * CHAIN_BOOST) * (perfect ? PERFECT_BOUNCE : 1) * (slam ? SLAM_BOUNCE : 1);
+  p.boost = HOLD_TIME;
+  if (sh.kind === 'hold') {
+    // ride the held note until its beat is over (or until you jump off)
+    const end = Math.max(wt + 0.15, sh.t + sh.len);
+    p.ride = { sh, start: wt, t1: wt, end, h: shH, voice: hum(tones[sh.level], tn, end - wt, vol * 0.8) };
+    trails.push(p.ride);
+    p.vy = 0; p.boost = 0; p.h = shH - PLAYER_H / 2;
+  }
+
+  hitStop = HITSTOP * (perfect || slam ? 1.5 : 1);
+  camKick = slam ? 16 : perfect ? 10 : 6;
+  p.flash = perfect ? 1 : 0.35;
+  p.rot = sh.phase + wt * sh.spin; p.spin = (sh.spin || 1) * 2.2;
+  morphTo({ sides: sh.sides, level: sh.level });
+  Object.assign(bgTarget, { h: HUES[sh.level % HUES.length], s: 22, l: 11 });
+  const col = a => shapeCol(sh.level, a);
+  ripples.push({ t: sh.t, h: shH, sides: sh.sides, col, rot: p.rot, age: 0 });
+  if (perfect) ripples.push({ t: sh.t, h: shH, sides: sh.sides, col: a => `rgba(227,232,239,${a})`, rot: p.rot, age: -0.08 });
+  burst(sx, shH, slam ? 24 : 12, col(1), slam ? 260 : 180);
+  pop(sx, shH + 34, (slam ? 'slam ' : '') + (perfect ? 'perfect ' : '') + '+' + gained, col(1));
+}
+function endRide(full) {
+  const p = player, r = p.ride;
+  p.ride = null;
+  if (!full) {
+    const g = r.voice.gain, now = ac.currentTime;
+    if (g.cancelAndHoldAtTime) g.cancelAndHoldAtTime(now); else g.cancelScheduledValues(now);
+    g.setTargetAtTime(0, now, 0.06);
+  }
+  p.vy = BOUNCE_V + Math.min(p.chain, 6) * CHAIN_BOOST; p.boost = HOLD_TIME; p.airJump = true; p.sq = 1.2;
+  if (full) {
+    const gained = 10 * p.chain;
+    score += gained;
+    pop(PX, p.h + 70, 'held +' + gained, shapeCol(r.sh.level, 1));
+  }
+  burst(PX, p.h + PLAYER_H / 2, 8, shapeCol(r.sh.level, 1), 120);
+}
+
+// Horizontal gap between a shape at x and the stretch a diving player can cover (PX - BACK_REACH .. PX).
+const backDist = x => x > PX ? x - PX : x < PX - BACK_REACH ? PX - BACK_REACH - x : 0;
+// Would a dive started now catch a shape below (ahead, or just passed)? Simulates the dive against
+// the nearby shapes and returns the first one it would hit (with its height offset, for the hint line).
+function diveTarget() {
+  const p = player, gF = GRAV * FALL_GRAV;
+  const pr = 4 + 16 * (p.form ? ease(p.m) : 1 - ease(p.m));
+  for (const sh of shapes) {
+    if (sh.hit) continue;
+    const sx0 = PX + (sh.t - wt) * SPEED;
+    if (sx0 < PX - BACK_REACH - 40) continue;
+    if (sx0 > PX + 360) break;
+    const reach = (sh.kind === 'grace' ? GRACE_R : SHAPE_R) + pr + 4;
+    const tx = (sx0 - PX) / SPEED, w = reach / SPEED;
+    for (let t = Math.max(0, tx - w); t <= tx + w; t += 0.015) {
+      const h = p.h - DIVE_V * t - gF * t * t / 2;
+      if (h < 0) break;
+      const base = shapeH(sh, wt + t);
+      for (const shH of sh.kind === 'chord' ? [base, base + LEVEL_GAP] : [base]) {
+        if (shH > p.h + PLAYER_H / 2) continue;   // only shapes below the player
+        const cy = clamp(shH, h + pr, h + PLAYER_H - pr);
+        if (Math.hypot(backDist(sx0 - SPEED * t), shH - cy) < reach) return { sh, h: shH - base };
+      }
+    }
+  }
+  return null;
+}
+
+// ---------- update ----------
+function update(dt) {
+  idleT += dt;
+  const kb = Math.min(1, dt * 2.5);
+  bg.h += (((bgTarget.h - bg.h + 540) % 360) - 180) * kb;
+  bg.s += (bgTarget.s - bg.s) * kb; bg.l += (bgTarget.l - bg.l) * kb;
+  const beatPhase = ((state === 'play' ? songT : idleT) / BEAT) % 1;
+  if (state === 'end') endT += dt;
+  if (state !== 'play') { updateFx(dt); return beatPhase; }
+
+  // follow the audio clock so visuals stay in sync with the music
+  songT += dt;
+  const at = ac.currentTime - song.start;
+  if (Math.abs(at - songT) > 0.25) songT = at; else songT += (at - songT) * 0.15;
+  camKick *= Math.exp(-dt * 14);
+
+  // hit-stop: the world freezes for a moment, then catches back up to the music
+  if (hitStop > 0) {
+    hitStop -= dt; lag += dt; wt = songT - lag;
+    updateFx(dt * 0.25);
+    return beatPhase;
+  }
+  lag = Math.max(0, lag - dt * 0.6);
+  wt = songT - lag;
+
+  const p = player;
+  p.jumpBuf -= dt;
+  const pressed = p.jumpBuf > 0, mode = p.bufMode;
+  const startDive = () => {
+    p.diveSh = diveTarget()?.sh;   // steer toward a catchable shape, if there is one
+    p.vy = -DIVE_V; p.boost = 0; p.diving = true; p.jumpBuf = 0; p.sq = 1.3;
+    thump(ac.currentTime, 300, 0.04);
+  };
+  if (p.ride) {
+    p.ride.t1 = wt;
+    const done = wt >= p.ride.end;
+    if (done || pressed) {
+      endRide(done); p.jumpBuf = 0;
+      if (!done && mode === 'down') startDive();
+    }
+  } else {
+    if (pressed && p.ground && mode !== 'down') {
+      p.vy = JUMP_V; p.boost = HOLD_TIME; p.ground = false; p.airJump = true; p.jumpBuf = 0; p.sq = 1.25;
+      thump(ac.currentTime, 220, 0.06);
+      burst(PX, 0, 4, lineA(0.6), 70);
+    } else if (pressed && !p.ground && !p.diving && (mode === 'down' || (mode === 'smart' && diveTarget()))) {
+      // down always dives; the smart press dives only when it would catch a shape below (the air jump is kept)
+      startDive();
+    } else if (pressed && !p.ground && p.airJump && mode !== 'down') {
+      // otherwise: one jump in the air, renewed by hitting a shape
+      p.vy = AIR_JUMP_V; p.boost = HOLD_TIME; p.airJump = false; p.jumpBuf = 0; p.sq = 1.2;
+      thump(ac.currentTime, 330, 0.05);
+      ripples.push({ t: wt, h: p.h, sides: 0, col: lineA, rot: 0, age: 0 });
+      burst(PX + p.dx, p.h, 6, lineA(0.6), 90);
+    }
+    if (!p.ground) {
+      // holding keeps the launch speed for a short time; releasing ends the boost for good
+      if (input.held && p.boost > 0 && p.vy > 0) p.boost -= dt;
+      else {
+        p.boost = 0;
+        let g = GRAV * (p.vy < 0 ? FALL_GRAV : 1);
+        if (Math.abs(p.vy) < HANG_V && !p.diving) g *= HANG_GRAV;
+        p.vy -= g * dt;
+      }
+      p.h += p.vy * dt;
+      if (p.h <= 0) {
+        const dove = p.diving;
+        if (p.chain > 0) energy = Math.max(0, energy - 1);
+        p.h = 0; p.vy = 0; p.ground = true; p.diving = false; p.chain = 0; p.sq = dove ? 0.5 : 0.65;
+        if (p.form) morphTo(null);
+        thump(ac.currentTime, dove ? 110 : 140, dove ? 0.09 : 0.05);
+        burst(PX + p.dx, 0, dove ? 10 : 5, lineA(0.5), dove ? 120 : 60);
+        if (dove) camKick = -6;
+      }
+    }
+  }
+  // while diving at a target, slide (only backwards, a little) to line up with it; otherwise drift home
+  const dsh = p.diving && p.diveSh && !p.diveSh.hit ? p.diveSh : null;
+  const want = dsh ? clamp(PX + (dsh.t - wt) * SPEED - PX, -BACK_REACH, 0) : 0;
+  const sv = (dsh ? STEER_V : RETURN_V) * dt;
+  p.dx += clamp(want - p.dx, -sv, sv);
+  p.sq += (1 - p.sq) * Math.min(1, dt * 12);
+  p.m = Math.min(1, p.m + dt / 0.16);
+  p.flash = Math.max(0, p.flash - dt * 3);
+  p.rot += p.spin * dt * (p.form ? 1 : 0);
+
+  // collisions: capsule around the player's line (or around its shape when merged)
+  const formAmt = p.form ? ease(p.m) : 1 - ease(p.m);
+  const pr = 4 + 16 * formAmt, px = PX + p.dx;
+  for (const sh of shapes) {
+    if (sh.hit) { sh.hitT += dt; continue; }
+    const sx = PX + (sh.t - wt) * SPEED;
+    if (sx < PX - BACK_REACH - 30 && !sh.missed) { sh.missed = true; if (sh.kind !== 'grace') energy = Math.max(0, energy - 0.5); }
+    if (sx < PX - BACK_REACH - 60) continue;
+    if (sx > PX + 60) break;
+    if (p.ride) continue;
+    const r = sh.kind === 'grace' ? GRACE_R : SHAPE_R, base = shapeH(sh, wt);
+    for (const shH of sh.kind === 'chord' ? [base, base + LEVEL_GAP] : [base]) {
+      const cy = clamp(shH, p.h + pr, p.h + PLAYER_H - pr);
+      const d = Math.hypot(sx - px, shH - cy), reach = r + pr + 4;
+      if (d < reach) { hitShape(sh, sx, base); break; }
+      // gentle pull toward a shape that is almost touching
+      if (!p.ground && sx > px - 10 && d < reach + MAGNET) p.h += (shH - cy) * Math.min(1, dt * 8) * 0.5;
+    }
+  }
+
+  // what an air press would do right now: dive into this shape (shown as a hint line), or jump
+  p.hint = !p.ground && !p.diving && !p.ride ? diveTarget() : null;
+
+  // camera rises to keep the player in view
+  const target = Math.max(0, p.h + PLAYER_H + 20 - GY + H * 0.22);
+  camH += (target - camH) * Math.min(1, dt * 5);
+
+  updateFx(dt);
+  if (songT > TOTAL_BARS * BAR + 2) endGame();
+  return beatPhase;
+}
+function updateFx(dt) {
+  for (const r of ripples) r.age += dt;
+  ripples = ripples.filter(r => r.age < 0.8);
+  for (const q of parts) { q.age += dt; q.x += (q.vx - SPEED * 0.6) * dt; q.h += q.vh * dt; q.vh -= 200 * dt; }
+  parts = parts.filter(q => q.age < q.life);
+  for (const q of pops) { q.age += dt; q.h += 30 * dt; q.x -= SPEED * 0.4 * dt; }
+  pops = pops.filter(q => q.age < 0.9);
+  trails = trails.filter(tr => PX + (tr.t1 - wt) * SPEED > -10);
+}
+
+// ---------- draw ----------
+const sy = h => GY - h + camH;
+const FONT = '"Segoe UI", system-ui, -apple-system, sans-serif';
+function text(str, x, y, size, col, align = 'center', weight = 300, spacing = 0) {
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = col;
+  if ('letterSpacing' in ctx) ctx.letterSpacing = spacing + 'px';
+  ctx.fillText(str, x, y);
+  if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+}
+
+const tmp = new Float32Array(NPTS * 2);
+function shapeOutline(sides, x, y, r, rot, col, lw, sqx = 1, sqy = 1) {
+  outlinePts(sides, r, rot, 0, 0, tmp);
+  if (sqx !== 1 || sqy !== 1) for (let i = 0; i < NPTS; i++) { tmp[i * 2] *= sqx; tmp[i * 2 + 1] *= sqy; }
+  strokeLoop(tmp, x, y, col, lw);
+}
+
+function draw(beatPhase) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = bgCol(); ctx.fillRect(0, 0, innerWidth, innerHeight);
+  ctx.setTransform(S * DPR, 0, 0, S * DPR, 0, 0);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+  const t = state === 'title' ? idleT : wt;
+  const pulse = Math.exp(-beatPhase * 6);
+  const scroll = t * SPEED;
+
+  drawWave();
+
+  // stars (slow parallax points)
+  for (const s of stars) {
+    const x = ((s.x * W - scroll * 0.08) % W + W) % W;
+    const y = ((s.y * H + camH * 0.25) % H + H) % H;
+    ctx.fillStyle = lineA(s.a); ctx.fillRect(x, y, s.r, s.r);
+  }
+
+  // world layer gets the camera kick
+  ctx.setTransform(S * DPR, 0, 0, S * DPR, 0, camKick * S * DPR);
+
+  // pitch "staff": faint dotted rows at each note height
+  for (let l = 0; l <= MAX_LEVEL; l++) {
+    const y = sy(levelH(l));
+    if (y < -10 || y > H + 10) continue;
+    ctx.fillStyle = shapeCol(l, 0.07 + pulse * 0.03);
+    for (let x = -(scroll * 0.5 % 22); x < W; x += 22) ctx.fillRect(x, y - 0.6, 1.2, 1.2);
+  }
+
+  // ground: one line + scrolling points that breathe with the beat
+  const gy = sy(0);
+  if (gy < H + 10) {
+    ctx.strokeStyle = lineA(0.75); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke();
+    ctx.fillStyle = lineA(0.25 + pulse * 0.35);
+    for (let x = -(scroll % 40); x < W; x += 40) ctx.fillRect(x - 1, gy + 7, 2, 2);
+  }
+
+  if (state === 'title') { ctx.setTransform(S * DPR, 0, 0, S * DPR, 0, 0); drawTitle(t); return; }
+
+  // tether: dotted thread keeping the player connected to the ground while airborne
+  if (player.h > 4 && gy < H + 10) {
+    ctx.fillStyle = lineA(0.22);
+    for (let h = 6; h < player.h; h += 9) ctx.fillRect(PX + player.dx - 0.8, sy(h) - 0.8, 1.6, 1.6);
+  }
+
+  // held-note trails: the line you drew while riding a circle
+  for (const tr of trails) {
+    const x0 = PX + (tr.start - wt) * SPEED, x1 = PX + (tr.t1 - wt) * SPEED, y = sy(tr.h);
+    ctx.strokeStyle = shapeCol(tr.sh.level, 0.55); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+    dot(x0, y, 2, shapeCol(tr.sh.level, 0.7));
+  }
+
+  // melody line: dotted thread joining the notes of each phrase, read it like sheet music
+  for (let i = 0; i < shapes.length - 1; i++) {
+    const a = shapes[i], b = shapes[i + 1];
+    const ax = PX + (a.t - t) * SPEED;
+    if (ax > W + 60) break;
+    if (a.hit || a.ph < 1 || b.ph !== a.ph) continue;
+    const bx = PX + (b.t - t) * SPEED;
+    if (bx < -60) continue;
+    const startX = ax + a.len * SPEED;
+    dotted(startX, sy(shapeH(a, t)), bx, sy(shapeH(b, t)), 9, shapeCol(a.level, a.missed ? 0.08 : 0.22), a.len ? 2 : SHAPE_R, SHAPE_R);
+  }
+
+  // shapes
+  for (const sh of shapes) {
+    const sx = PX + (sh.t - t) * SPEED;
+    if (sx + sh.len * SPEED < -60) continue;
+    if (sx > W + 60) break;
+    const isGrace = sh.kind === 'grace';
+    const colFn = isGrace ? lineA : a => shapeCol(sh.level, a);
+    if (sh.hit) {
+      // squash, then get absorbed into the player's outline
+      if (isGrace || sh.hitT > 0.2) continue;
+      const u = sh.hitT / 0.2, k = ease(u), sq = Math.sin(u * Math.PI) * 0.3;
+      const cx = sh.hx + (PX + player.dx - sh.hx) * k, ch = sh.hh + (player.h + PLAYER_H / 2 - sh.hh) * k;
+      const r = SHAPE_R + (22 - SHAPE_R) * k;
+      shapeOutline(sh.sides, cx, sy(ch), r, player.rot, colFn(1 - k), 2, 1 + sq, 1 - sq);
+      if (sh.kind === 'chord') {
+        const uh = sh.hh + LEVEL_GAP, ch2 = uh + (player.h + PLAYER_H / 2 - uh) * k;
+        shapeOutline(SIDES[sh.level + 1], cx, sy(ch2), r, player.rot, shapeCol(sh.level + 1, 1 - k), 2, 1 + sq, 1 - sq);
+      }
+      continue;
+    }
+    const shH = shapeH(sh, t);
+    const a = sh.missed ? 0.3 : 0.9, y = sy(shH);
+    const rot = sh.phase + t * sh.spin, pr = 1 + pulse * 0.05;
+    if (isGrace) {
+      shapeOutline(4, sx, y, GRACE_R * pr, sh.phase, colFn(a * 0.9), 1.5);
+      continue;
+    }
+    if (sh.kind === 'hold') {
+      // the circle plus the length of the note it sustains
+      const x1 = sx + sh.len * SPEED;
+      dotted(sx, y, x1, y, 6, colFn(a * 0.5), SHAPE_R, 0);
+      dot(x1, y, 2, colFn(a * 0.7));
+    }
+    if (sh.kind === 'chord') {
+      const y2 = sy(shH + LEVEL_GAP);
+      shapeOutline(SIDES[sh.level + 1], sx, y2, SHAPE_R * pr, -rot, shapeCol(sh.level + 1, a), 1.8);
+      dot(sx, y2, 1.6, shapeCol(sh.level + 1, a * 0.8));
+      ctx.strokeStyle = colFn(a * 0.5); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(sx, y - SHAPE_R); ctx.lineTo(sx, y2 + SHAPE_R); ctx.stroke();
+    }
+    shapeOutline(sh.sides, sx, y, SHAPE_R * pr, rot, colFn(a), 1.8);
+    dot(sx, y, 1.6, colFn(a * 0.8));
+  }
+
+  // ripples from hits
+  for (const r of ripples) {
+    if (r.age < 0) continue;
+    const k = r.age / 0.8, x = PX + (r.t - wt) * SPEED;
+    shapeOutline(r.sides, x, sy(r.h), SHAPE_R * (1 + ease(k) * 1.8), r.rot, r.col(0.55 * (1 - k)), 1.2);
+  }
+
+  // particles (points)
+  for (const q of parts) {
+    ctx.globalAlpha = 1 - q.age / q.life;
+    ctx.fillStyle = q.col; ctx.fillRect(q.x - 1.2, sy(q.h) - 1.2, 2.4, 2.4);
+  }
+  ctx.globalAlpha = 1;
+
+  drawPlayer();
+
+  for (const q of pops) {
+    ctx.globalAlpha = 1 - q.age / 0.9;
+    text(q.text, q.x, sy(q.h), 15, q.col, 'center', 400);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.setTransform(S * DPR, 0, 0, S * DPR, 0, 0);
+  drawHud();
+  if (state === 'end') drawEnd();
+}
+
+function drawPlayer() {
+  const p = player;
+  if (p.hint && !p.hint.sh.hit) {
+    // dive hint: a faint dotted line to the shape a press would dive into
+    const sh = p.hint.sh, grace = sh.kind === 'grace';
+    const hx = PX + (sh.t - wt) * SPEED, hy = sy(shapeH(sh, wt) + p.hint.h);
+    dotted(PX + p.dx, sy(p.h), hx, hy, 7, grace ? lineA(0.35) : shapeCol(sh.level, 0.35), 2, grace ? GRACE_R : SHAPE_R);
+  }
+  if (p.form) outlinePts(p.form.sides, 22, p.rot, 0, -PLAYER_H / 2, p.tgt);
+  else linePts(PLAYER_H * p.sq, p.tgt);
+  const k = ease(p.m);
+  for (let i = 0; i < NPTS * 2; i++) p.pts[i] = p.from[i] + (p.tgt[i] - p.from[i]) * k;
+  const col = p.form ? shapeCol(p.form.level, 1) : LINE;
+  ctx.shadowColor = col; ctx.shadowBlur = 8 + Math.min(p.chain, 8) * 1.5 + p.flash * 10;
+  strokeLoop(p.pts, PX + p.dx, sy(p.h), col, 2.4);
+  if (p.flash > 0) {
+    ctx.globalAlpha = p.flash;
+    ctx.shadowColor = FLASH;
+    strokeLoop(p.pts, PX + p.dx, sy(p.h), FLASH, 2.4);
+    ctx.globalAlpha = 1;
+  }
+  ctx.shadowBlur = 0;
+  if (p.ground) dot(PX + p.dx, sy(0), 2.6, LINE);
+  else if (p.airJump && !p.ride) dot(PX + p.dx, sy(p.h) + 7, 2, lineA(0.7));   // air jump still available
+  if (p.diving) {   // speed trail above the player
+    const top = p.h + PLAYER_H * (p.form ? 1 : p.sq);
+    for (let i = 1; i <= 6; i++) ctx.fillStyle = lineA(0.5 - i * 0.07), ctx.fillRect(PX + p.dx - 1, sy(top + i * 10) - 1, 2, 2);
+  }
+}
+
+// the music's waveform, drawn faint behind everything in the background's own hue
+function drawWave() {
+  if (!analyser) return;
+  analyser.getFloatTimeDomainData(waveBuf);
+  let start = 0;
+  for (let i = 1; i < waveBuf.length / 2; i++) if (waveBuf[i - 1] < 0 && waveBuf[i] >= 0) { start = i; break; }
+  const n = waveBuf.length / 2, cy = H * 0.42, amp = H * 0.5;
+  ctx.beginPath();
+  for (let i = 0; i < n; i += 2) {
+    const x = i / n * W, y = cy - clamp(waveBuf[start + i] * amp, -H * 0.3, H * 0.3);
+    if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+  }
+  ctx.strokeStyle = `hsla(${bg.h},${bg.s + 6}%,52%,0.22)`; ctx.lineWidth = 1.4; ctx.stroke();
+}
+
+function drawHud() {
+  const prog = clamp(songT / (TOTAL_BARS * BAR), 0, 1);
+  ctx.strokeStyle = lineA(0.15); ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(24, 18); ctx.lineTo(W - 24, 18); ctx.stroke();
+  ctx.strokeStyle = lineA(0.55);
+  ctx.beginPath(); ctx.moveTo(24, 18); ctx.lineTo(24 + (W - 48) * prog, 18); ctx.stroke();
+  dot(24 + (W - 48) * prog, 18, 2.6, LINE);
+
+  text(String(score), 24, 50, 30, LINE, 'left', 300);
+  // band layers: one point per instrument group currently playing
+  for (let i = 0; i < 4; i++) {
+    const on = energy >= i + 1, part = clamp(energy - i, 0, 1);
+    dot(28 + i * 12, 76, on ? 2.6 : 1.8, on ? shapeCol(i * 2, 0.9) : lineA(0.15 + part * 0.3));
+  }
+  if (player.chain > 1) text('×' + player.chain, 24, 98, 16, shapeCol(Math.min(player.chain, MAX_LEVEL), 0.9), 'left', 400);
+  text('best ' + best, W - 24, 50, 15, lineA(0.55), 'right', 300, 1);
+}
+
+function drawTitle(t) {
+  // drifting demo shapes
+  for (let i = 0; i < 6; i++) {
+    const x = ((W * (0.15 + i * 0.17) - t * 30) % (W + 80) + W + 80) % (W + 80) - 40;
+    const h = levelH(i) + Math.sin(t * 1.5 + i) * 8;
+    shapeOutline(i === 4 ? 0 : SIDES[i], x, sy(h), SHAPE_R, t * 0.6 * (i % 2 ? 1 : -1) + i, shapeCol(i, 0.45), 1.5);
+  }
+  linePts(PLAYER_H, tmp);
+  strokeLoop(tmp, PX, sy(0), LINE, 2.4);
+  dot(PX, sy(0), 2.6, LINE);
+
+  text('jumpscore', W / 2, H * 0.3, 54, LINE, 'center', 200, 10);
+  text('jump into the shapes to play the song — hit them on the beat', W / 2, H * 0.3 + 52, 16, lineA(0.6), 'center', 300, 1);
+  text('space · click · tap   —   hold to jump higher   —   tap in the air to jump again, or to dive', W / 2, H * 0.3 + 80, 14, lineA(0.4), 'center', 300, 1);
+  text('↑ / W always jumps   ·   ↓ / S always dives', W / 2, H * 0.3 + 100, 13, lineA(0.32), 'center', 300, 1);
+  const a = 0.35 + 0.3 * Math.sin(t * 3) ** 2;
+  text('press to begin', W / 2, H * 0.3 + 130, 15, lineA(a), 'center', 400, 3);
+  if (best) text('best ' + best, W / 2, H * 0.3 + 160, 13, lineA(0.35), 'center', 300, 2);
+  text('Created by Tomazella Games with Claude Code', W / 2, H - 22, 12, lineA(0.38), 'center', 300, 2);
+}
+
+function drawEnd() {
+  const k = ease(endT / 0.8);
+  ctx.fillStyle = bgCol(0.82 * k); ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = k;
+  const cy = H * 0.36;
+  text('the song is over', W / 2, cy - 60, 15, lineA(0.55), 'center', 300, 3);
+  text(String(score), W / 2, cy, 64, LINE, 'center', 200, 2);
+  text(newBest ? 'new best' : 'best ' + best, W / 2, cy + 52, 16, newBest ? shapeCol(3, 1) : lineA(0.55), 'center', 400, 3);
+  ctx.strokeStyle = lineA(0.2); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(W / 2 - 120, cy + 82); ctx.lineTo(W / 2 + 120, cy + 82); ctx.stroke();
+  text(`notes ${stats.hits} / ${stats.total}   ·   perfect ${stats.perfect}   ·   longest chain ${stats.chain}   ·   highest note ${stats.top + 1}`,
+    W / 2, cy + 108, 13, lineA(0.5), 'center', 300, 1);
+  if (endT > 1.2) text('press to play again', W / 2, cy + 160, 14, lineA(0.35 + 0.3 * Math.sin(endT * 3) ** 2), 'center', 400, 3);
+  text('Created by Tomazella Games with Claude Code', W / 2, H - 22, 12, lineA(0.38), 'center', 300, 2);
+  ctx.globalAlpha = 1;
+}
+
+// ---------- loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000); last = now;
+  draw(update(dt));
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
