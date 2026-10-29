@@ -19,6 +19,8 @@ Shapes drift toward you along a faint musical staff: higher shapes are higher no
 | **↑** / **W** | Always jump |
 | **↓** / **S** | Always dive |
 
+The first time you play, a short tutorial pauses mid-jump to teach the air jump and the dive. You can replay it from the end screen (button or **T**).
+
 ### Shapes
 
 - **Polygons** (triangles, squares, pentagons, hexagons, octagons): single notes. Bounce off them to chain into the next one.

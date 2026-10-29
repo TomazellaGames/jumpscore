@@ -69,6 +69,8 @@ function rngFrom(seed) {
 }
 function loadBest() { try { return +localStorage.getItem('jumpscore.best') || 0; } catch (e) { return 0; } }
 function saveBest(v) { try { localStorage.setItem('jumpscore.best', String(v)); } catch (e) {} }
+function loadTutSeen() { try { return localStorage.getItem('jumpscore.tutorial') === '1'; } catch (e) { return false; } }
+function saveTutSeen() { try { localStorage.setItem('jumpscore.tutorial', '1'); } catch (e) {} }
 
 // ---------- audio ----------
 let ac, master, revSend, delaySend, noiseBuf, analyser, waveBuf;
@@ -419,13 +421,47 @@ function resetPlayer() {
   linePts(PLAYER_H, player.pts);
 }
 
-function startGame() {
+// ---------- tutorial: a short scripted run that freezes to teach the air jump and the drop ----------
+// It jumps for you, freezes at the top of the jump until you air jump into a high shape, then freezes
+// again at the top of the bounce until you drop into a low one. Every launch counts as fully held.
+const TUT_JUMP = 1, TUT_AIR = 0.3, TUT_DROP = 0.25;   // auto jump time; how far ahead each target waits
+let tut = null;   // { step: 'air' | 'drop' | 'finish' | 'done', frozen: null | 'air' | 'drop', doneT }
+let tutSeen = loadTutSeen();
+function tutShapes() {
+  const mk = (t, level) => ({ t, level, kind: 'note', ph: 0, sides: SIDES[level], len: 0, phase: 0, spin: 0.6, hit: false, hitT: 0, missed: false });
+  return [mk(TUT_JUMP + 0.46 + TUT_AIR, 4), mk(TUT_JUMP + 1.58, 0)];
+}
+function tutStep(dt) {
+  const p = player;
+  if (tut.step === 'air' && p.ground && wt >= TUT_JUMP) { p.jumpBuf = 0.12; p.bufMode = 'up'; }
+  else if ((tut.step === 'air' || tut.step === 'drop') && !p.ground && !p.ride && p.vy <= 0 && p.jumpBuf <= 0) {
+    // top of the arc: line the lesson's shape up just ahead, then wait for the right press
+    const sh = shapes[tut.step === 'air' ? 0 : 1];
+    if (!sh.hit) sh.t = wt + (tut.step === 'air' ? TUT_AIR : TUT_DROP);
+    p.hint = tut.step === 'drop' ? diveTarget() : null;
+    tut.frozen = tut.step;
+    ac.suspend();
+  } else if (tut.step === 'finish' && (p.ground || shapes[1].hit)) { tut.step = 'done'; tutSeen = true; saveTutSeen(); }
+  if (tut.step === 'done') tut.doneT += dt;
+}
+function tutPress(mode) {
+  if (tut.step === 'done') { if (tut.doneT > 0.6) startGame(); return; }
+  const f = tut.frozen;
+  if (!f || mode === (f === 'air' ? 'down' : 'up')) return;
+  tut.frozen = null; tut.step = f === 'air' ? 'drop' : 'finish';
+  player.jumpBuf = 0.12; player.bufMode = f === 'air' ? 'up' : 'down';
+  ac.resume();
+}
+const tutButton = () => ({ x: W / 2 - 90, y: H * 0.36 + 196, w: 180, h: 34 });
+
+function startGame(tutorial = false) {
   if (!ac) initAudio();
   if (ac.state === 'suspended') ac.resume();
   const rng = rngFrom((Math.random() * 1e9) | 0);
   song = { key: KEYS[Math.floor(rng() * KEYS.length)], prog: PROGS[Math.floor(rng() * PROGS.length)], start: ac.currentTime + 0.15, step: 0 };
   song.nextT = song.start;
-  shapes = genShapes(rng);
+  shapes = tutorial ? tutShapes() : genShapes(rng);
+  tut = tutorial ? { step: 'air', frozen: null, doneT: 0 } : null;
   ripples = []; parts = []; pops = []; trails = [];
   score = 0; newBest = false; energy = 0;
   stats = { hits: 0, total: shapes.length, perfect: 0, chain: 0, top: -1 };
@@ -440,20 +476,30 @@ function endGame() {
 // ---------- input ----------
 // mode: 'smart' (space, click, tap: dive if it would catch a shape, else jump), 'up' (always jump), 'down' (always dive)
 function press(mode = 'smart') {
-  if (state === 'title') { startGame(); return; }
+  if (state === 'title') { startGame(!tutSeen); return; }
   if (state === 'end') { if (endT > 1.2) startGame(); return; }
-  input.held = true; player.jumpBuf = 0.12; player.bufMode = mode;
+  input.held = true;
+  if (tut) { tutPress(mode); return; }
+  player.jumpBuf = 0.12; player.bufMode = mode;
 }
 function release() { input.held = false; }
 const KEY_MODES = { Space: 'smart', Enter: 'smart', KeyZ: 'smart', ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down' };
-addEventListener('keydown', e => { const m = KEY_MODES[e.code]; if (m) { e.preventDefault(); if (!e.repeat) press(m); } });
+addEventListener('keydown', e => {
+  if (e.code === 'KeyT' && state === 'end' && endT > 1.2) { startGame(true); return; }
+  const m = KEY_MODES[e.code]; if (m) { e.preventDefault(); if (!e.repeat) press(m); }
+});
 addEventListener('keyup', e => { if (KEY_MODES[e.code]) release(); });
-cv.addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const b = tutButton(), x = e.clientX / S, y = e.clientY / S;
+  if (state === 'end' && endT > 1.2 && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { startGame(true); return; }
+  press();
+});
 addEventListener('pointerup', release);
 addEventListener('pointercancel', release);
 document.addEventListener('visibilitychange', () => {
   if (!ac) return;
-  if (document.hidden) ac.suspend(); else if (state === 'play') ac.resume();
+  if (document.hidden) ac.suspend(); else if (state === 'play' && !tut?.frozen) ac.resume();
 });
 
 // ---------- effects ----------
@@ -582,6 +628,7 @@ function update(dt) {
   const beatPhase = ((state === 'play' ? songT : idleT) / BEAT) % 1;
   if (state === 'end') endT += dt;
   if (state !== 'play') { updateFx(dt); return beatPhase; }
+  if (tut?.frozen) return beatPhase;   // tutorial freeze: the world and the music wait for the press
 
   // follow the audio clock so visuals stay in sync with the music
   songT += dt;
@@ -599,6 +646,7 @@ function update(dt) {
   wt = songT - lag;
 
   const p = player;
+  if (tut) { tutStep(dt); if (tut.frozen) return beatPhase; }
   p.jumpBuf -= dt;
   const pressed = p.jumpBuf > 0, mode = p.bufMode;
   // a press dives into the shape the hint line points at (what the player saw last frame), else re-check now
@@ -632,7 +680,7 @@ function update(dt) {
     }
     if (!p.ground) {
       // holding keeps the launch speed for a short time; releasing ends the boost for good
-      if (input.held && p.boost > 0 && p.vy > 0) p.boost -= dt;
+      if ((input.held || tut) && p.boost > 0 && p.vy > 0) p.boost -= dt;
       else {
         p.boost = 0;
         let g = GRAV * (p.vy < 0 ? FALL_GRAV : 1);
@@ -854,7 +902,7 @@ function draw(beatPhase) {
   ctx.globalAlpha = 1;
 
   ctx.setTransform(S * DPR, 0, 0, S * DPR, 0, 0);
-  drawHud();
+  if (tut) drawTutorial(); else drawHud();
   if (state === 'end') drawEnd();
 }
 
@@ -921,6 +969,25 @@ function drawHud() {
   text('best ' + best, W - 24, 50, 15, lineA(0.55), 'right', 300, 1);
 }
 
+function drawTutorial() {
+  text('tutorial', W / 2, 30, 13, lineA(0.4), 'center', 300, 4);
+  const cx = W * 0.64, cy = H * 0.4, f = tut.frozen;
+  if (f) {
+    // a ring pulsing out of the shape to reach
+    const sh = shapes[f === 'air' ? 0 : 1], k = (idleT * 1.2) % 1;
+    shapeOutline(0, PX + (sh.t - wt) * SPEED, sy(shapeH(sh, wt)) + camKick, SHAPE_R + 4 + ease(k) * 22, 0, lineA(0.6 * (1 - k)), 1.4);
+    text(f === 'air' ? 'jump again in the air' : 'drop down', cx, cy, 26, LINE, 'center', 200, 3);
+    text(f === 'air' ? 'touch / click   or   press ↑ / W' : 'touch / click   or   press ↓ / S', cx, cy + 40, 16, lineA(0.75), 'center', 300, 2);
+    text(f === 'air' ? 'you get one air jump, renewed by every shape you hit' : 'dive into shapes below you — slams score extra',
+      cx, cy + 68, 13, lineA(0.45), 'center', 300, 1);
+  } else if (tut.step === 'done') {
+    ctx.globalAlpha = ease(tut.doneT / 0.4);
+    text("that's it", cx, cy, 26, LINE, 'center', 200, 3);
+    if (tut.doneT > 0.6) text('press to play', cx, cy + 40, 15, lineA(0.35 + 0.3 * Math.sin(tut.doneT * 3) ** 2), 'center', 400, 3);
+    ctx.globalAlpha = 1;
+  }
+}
+
 function drawTitle(t) {
   // drifting demo shapes
   for (let i = 0; i < 6; i++) {
@@ -954,7 +1021,13 @@ function drawEnd() {
   ctx.beginPath(); ctx.moveTo(W / 2 - 120, cy + 82); ctx.lineTo(W / 2 + 120, cy + 82); ctx.stroke();
   text(`notes ${stats.hits} / ${stats.total}   ·   perfect ${stats.perfect}   ·   longest chain ${stats.chain}   ·   highest note ${stats.top + 1}`,
     W / 2, cy + 108, 13, lineA(0.5), 'center', 300, 1);
-  if (endT > 1.2) text('press to play again', W / 2, cy + 160, 14, lineA(0.35 + 0.3 * Math.sin(endT * 3) ** 2), 'center', 400, 3);
+  if (endT > 1.2) {
+    text('press to play again', W / 2, cy + 160, 14, lineA(0.35 + 0.3 * Math.sin(endT * 3) ** 2), 'center', 400, 3);
+    const b = tutButton();
+    ctx.strokeStyle = lineA(0.35); ctx.lineWidth = 1;
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+    text('tutorial  ·  T', W / 2, b.y + b.h / 2, 13, lineA(0.6), 'center', 400, 2);
+  }
   text('Created by Tomazella Games with Claude Code', W / 2, H - 22, 12, lineA(0.38), 'center', 300, 2);
   ctx.globalAlpha = 1;
 }
