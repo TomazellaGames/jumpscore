@@ -32,6 +32,10 @@ const HITSTOP = 0.05;
 const LEVEL_BASE = 90, LEVEL_GAP = 60, MAX_LEVEL = 9;
 const PLAYER_H = 44, SHAPE_R = 24, GRACE_R = 11, GRACE_H = 80, NPTS = 48;
 const GROUND_F = 0.78;            // ground line position (fraction of screen height)
+// waves: a circle whose line wiggles like a melody (peaks up to ~1.3 × WAVE_A px), then ends straight, or bends
+// WAVE_BEND px over its last WAVE_L s
+// up or down and throws the player that way
+const WAVE_LEN = BEAT * 1.5, WAVE_A = 16, WAVE_L = BEAT / 2, WAVE_BEND = 50, WAVE_UP_V = 820, WAVE_DOWN_V = 120;
 
 // ---------- palette (soft, low-contrast-but-readable) ----------
 const LINE = '#aeb7c4';
@@ -200,6 +204,28 @@ function hum(n, t, dur, v) {
   lfo.start(t); lfo.stop(t + dur + 0.6);
   return g;
 }
+// a wave's voice: its pitch and brightness follow the line you ride, then it glides with the throw (by `glide` cents)
+function waveHum(n, t, dur, v, sh, u0, glide) {
+  const f0 = NOTE(n), g = ac.createGain(), f = ac.createBiquadFilter(), N = 64;
+  const det = new Float32Array(N), cut = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const [wig, bend] = waveParts(sh, u0 + i / (N - 1) * dur);
+    det[i] = wig * 50 + glide * bend * bend;
+    cut[i] = 1300 + wig * 900 + bend * 1600;
+  }
+  f.type = 'lowpass'; f.Q.value = 3;
+  f.frequency.setValueCurveAtTime(cut, t, dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(v, t + 0.02);
+  g.gain.setValueAtTime(v, t + dur);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.5);
+  f.connect(g); g.connect(master); g.connect(revSend); g.connect(delaySend);
+  for (const [type, mul, gain] of [['sine', 1, 1], ['triangle', 2, 0.2], ['sawtooth', 1, 0.1]]) {
+    const gg = ac.createGain(); gg.gain.value = gain; gg.connect(f);
+    osc(type, f0 * mul, t, dur + 0.55, gg).detune.setValueCurveAtTime(det, t, dur);
+  }
+  return g;
+}
 function ting(n, t, v = 0.09) {
   const g = ac.createGain();
   g.gain.setValueAtTime(0.0001, t);
@@ -298,8 +324,9 @@ function riseAt(t, v, hold) {
 }
 const GAP_CHOICES = [4, 6, 3, 8, 5, 2];   // in 16ths, most musical first
 // Pick a gap after which a shape at level `to` is reachable by bouncing off `from` (no air jump needed).
-function gapFor(from, to, rng) {
-  const b0 = levelH(from) - 40, c = levelH(to), v = BOUNCE_V + CHAIN_BOOST * 2;
+const gapFor = (from, to, rng) => gapFrom(levelH(from) - 40, BOUNCE_V + CHAIN_BOOST * 2, levelH(to), rng);
+// Same, for any launch: from height b0 at speed v (with or without holding) to a shape at height c.
+function gapFrom(b0, v, c, rng) {
   const ok = GAP_CHOICES.filter(k => {
     const t = k * STEP;
     return b0 + riseAt(t, v, true) >= c - 60 && b0 + riseAt(t, v, false) <= c + 16;
@@ -307,19 +334,96 @@ function gapFor(from, to, rng) {
   if (!ok.length) return 0;
   return ok.length > 1 && rng() < 0.25 ? ok[1] : ok[0];
 }
+// A wave's contour, like a short melody: peaks of varying height, mostly alternating up and down,
+// spaced by 16ths and dotted 16ths. [[time, height -1.3..1.3], ...], flat at both ends.
+function wavePts(rng) {
+  const pts = [[0, 0]];
+  let u = STEP / 2, s = rng() < 0.5 ? 1 : -1;
+  while (u < WAVE_LEN - STEP / 2) {
+    pts.push([u, s * (0.35 + rng() * 0.95)]);
+    if (rng() < 0.8) s = -s;   // sometimes two peaks the same way: a step up or down the phrase
+    u += STEP * [1, 1, 1.5, 2][Math.floor(rng() * 4)];
+  }
+  pts.push([WAVE_LEN, 0]);
+  return pts;
+}
+// A wave's line u seconds after its start: [wiggle, bend 0..1 over the last cycle (none if it ends straight)]
+function waveParts(sh, u) {
+  u = clamp(u, 0, sh.len);
+  const bend = sh.exit === 'flat' ? 0 : clamp((u - (sh.len - WAVE_L)) / WAVE_L, 0, 1), p = sh.pts;
+  let i = 1;
+  while (i < p.length - 1 && p[i][0] < u) i++;
+  // eased between peaks, so the line is smooth and flattens at every peak
+  const [t0, v0] = p[i - 1], [t1, v1] = p[i], x = clamp((u - t0) / (t1 - t0), 0, 1);
+  return [(v0 + (v1 - v0) * (1 - Math.cos(Math.PI * x)) / 2) * (1 - bend), bend];
+}
+// height of the wave's line above its circle (the bend eases in, so the line is already moving at the throw)
+function waveOff(sh, u) {
+  const [wig, bend] = waveParts(sh, u);
+  return wig * WAVE_A + (sh.exit === 'up' ? 1 : sh.exit === 'down' ? -1 : 0) * WAVE_BEND * bend * bend;
+}
+// Height t seconds after being thrown from b0 at speed v with no input (the same gravity steps as update()).
+function throwH(b0, v, t) {
+  let h = b0;
+  for (let s = 0, dt = 1 / 240; s < t; s += dt) {
+    let g = GRAV * (v < 0 ? FALL_GRAV : 1);
+    if (Math.abs(v) < HANG_V) g *= HANG_GRAV;
+    v -= g * dt; h += v * dt;
+  }
+  return h;
+}
+// Gap after which a shape at height c sits right on that throw's path, so it is caught without doing anything.
+function throwGap(b0, v, c) {
+  return GAP_CHOICES.find(k => {
+    const h = throwH(b0, v, k * STEP);
+    return h > 0 && Math.abs(h + PLAYER_H / 2 - c) < 24;
+  }) || 0;
+}
+// The note that catches a wave's throw, so the chain survives: higher after an up throw, lower after a down one.
+// If no note fits the throw, the wave ends straight instead and releases you like a held note.
+function waveNext(w, rng) {
+  const l = w.level, b0 = levelH(l) + waveOff(w, w.len) - PLAYER_H / 2;
+  if (w.exit !== 'flat') {
+    const up = w.exit === 'up';
+    for (const d of up ? [3, 4, 2, 5, 1] : [-3, -4, -2, -5, -6, -1]) {
+      const nl = l + d;
+      if (nl < 0 || nl > MAX_LEVEL) continue;
+      const k = throwGap(b0, up ? WAVE_UP_V : -WAVE_DOWN_V, levelH(nl));
+      if (k) { w.to = nl; return { level: nl, k }; }
+    }
+    w.exit = 'flat';
+  }
+  for (const d of [1, -1, 0, 2, -2]) {
+    const nl = clamp(l + d, 0, MAX_LEVEL), k = gapFor(l, nl, rng);
+    if (k) return { level: nl, k };
+  }
+  return null;
+}
 const INTERVALS = [-2, -1, -1, 0, 0, 1, 1, 1, 2, 2];
-// kinds: note (bounce), hold (circle you ride for a beat), chord (two stacked notes), grace (small low hop)
+const LENS = { hold: BEAT, wave: WAVE_LEN };
+// kinds: note (bounce), hold (circle you ride for a beat), wave (circle you ride along a wiggling line, which may
+// throw you up or down), chord (two stacked notes), grace (small low hop)
 function genShapes(rng) {
   const out = [], end = Math.floor((TOTAL_BARS * BAR - 2) / STEP);   // shapes until 2s before the song ends
   let ph = 0;
-  const add = (step, l, kind = 'note') => out.push({
-    t: step * STEP, level: l, kind, ph, sides: kind === 'hold' ? 0 : SIDES[l], len: kind === 'hold' ? BEAT : 0,
-    phase: rng() * 6.28, spin: (rng() < 0.5 ? -1 : 1) * (0.5 + rng() * 0.6), hit: false, hitT: 0, missed: false,
-  });
+  const exitFor = l => {
+    const r = rng();
+    return r < 0.4 && l < MAX_LEVEL ? 'up' : r < 0.8 && l > 0 ? 'down' : 'flat';
+  };
+  const add = (step, l, kind = 'note') => {
+    const sh = {
+      t: step * STEP, level: l, kind, ph, sides: LENS[kind] ? 0 : SIDES[l], len: LENS[kind] || 0,
+      exit: kind === 'wave' ? exitFor(l) : null, pts: kind === 'wave' ? wavePts(rng) : null,
+      phase: rng() * 6.28, spin: (rng() < 0.5 ? -1 : 1) * (0.5 + rng() * 0.6), hit: false, hitT: 0, missed: false,
+    };
+    out.push(sh);
+    return sh;
+  };
   const kindFor = (l, prog) => {
     const r = rng();
-    if (r < 0.1 + prog * 0.06) return 'hold';
-    if (r < 0.2 + prog * 0.08 && l < MAX_LEVEL) return 'chord';
+    if (r < 0.09 + prog * 0.05) return 'hold';
+    if (r < 0.18 + prog * 0.1) return 'wave';
+    if (r < 0.27 + prog * 0.12 && l < MAX_LEVEL) return 'chord';
     return 'note';
   };
   let s = 32;
@@ -330,18 +434,25 @@ function genShapes(rng) {
     // a short motif, then the motif again (sometimes inverted) — call and answer
     const motif = Array.from({ length: 2 + Math.floor(rng() * 3) }, () => INTERVALS[Math.floor(rng() * INTERVALS.length)]);
     const steps = motif.concat(rng() < 0.5 ? motif : motif.map(x => -x));
-    let l = Math.floor(rng() * (2 + prog * 2)), kind = 'note';
-    add(s, l);
-    for (const iv of steps) {
-      let nl = l + iv + (rng() < 0.1 + prog * 0.2 ? 1 : 0);
-      if (nl < 0 || nl > MAX_LEVEL) nl = l - iv;
-      nl = clamp(nl, 0, MAX_LEVEL);
-      const held = kind === 'hold' ? 4 : 0;   // a held note releases you one beat later
-      const k = gapFor(l, nl, rng);
+    let l = Math.floor(rng() * (2 + prog * 2)), prev = add(s, l);
+    // a wave always gets a next note on its throw's path, even past the end of the motif
+    for (let i = 0; i < steps.length || prev.kind === 'wave'; i++) {
+      let nl, k;
+      if (prev.kind === 'wave') {
+        const nx = waveNext(prev, rng);
+        if (!nx) break;
+        ({ level: nl, k } = nx);
+      } else {
+        nl = l + steps[i] + (rng() < 0.1 + prog * 0.2 ? 1 : 0);
+        if (nl < 0 || nl > MAX_LEVEL) nl = l - steps[i];
+        nl = clamp(nl, 0, MAX_LEVEL);
+        k = gapFor(l, nl, rng);
+      }
+      const held = Math.round(prev.len / STEP);   // a held note or wave releases you when it ends
       if (!k || s + held + k >= end) break;
-      s += held + k; kind = kindFor(nl, prog); add(s, nl, kind); l = nl;
+      s += held + k; prev = add(s, nl, kindFor(nl, prog)); l = nl;
     }
-    if (kind === 'hold') s += 4;
+    s += Math.round(prev.len / STEP);
     // grace notes in the rest: quick low hops on eighths
     let g = s + 6;
     if (rng() < 0.45) {
@@ -385,6 +496,16 @@ function strokeLoop(pts, ox, oy, col, lw) {
   ctx.moveTo(ox + pts[0], oy + pts[1]);
   for (let i = 1; i < NPTS; i++) ctx.lineTo(ox + pts[i * 2], oy + pts[i * 2 + 1]);
   ctx.closePath();
+  ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke();
+}
+// a wave's line from u0 to u1 seconds after its start; sx is where its circle is, h its height
+function waveLine(sh, sx, h, u0, u1, col, lw) {
+  ctx.beginPath();
+  for (let u = Math.max(0, u0); ; u += 0.01) {
+    u = Math.min(u, u1);
+    ctx.lineTo(sx + u * SPEED, sy(h + waveOff(sh, u)));
+    if (u >= u1) break;
+  }
   ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke();
 }
 function dot(x, y, r, col) { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
@@ -452,7 +573,8 @@ function tutPress(mode) {
   player.jumpBuf = 0.12; player.bufMode = f === 'air' ? 'up' : 'down';
   ac.resume();
 }
-const tutButton = () => ({ x: W / 2 - 90, y: H * 0.36 + 196, w: 180, h: 34 });
+// end-screen button, between the ground line and the credits
+const tutButton = () => ({ x: W / 2 - 90, y: (GY + H - 22) / 2 - 17, w: 180, h: 34 });
 
 function startGame(tutorial = false) {
   if (!ac) initAudio();
@@ -537,7 +659,7 @@ function hitShape(sh, sx, shH) {
 
   const vol = 0.2 * (1 - sh.level * 0.04) * (1 + c * 0.04) * (perfect ? 1.2 : 1);
   const bright = c / 8 + (perfect ? 0.5 : 0);
-  bell(tones[sh.level], tn, sh.kind === 'hold' ? vol * 0.5 : vol, bright);
+  bell(tones[sh.level], tn, sh.len ? vol * 0.5 : vol, bright);
   if (sh.kind === 'chord') bell(tones[sh.level + 1], tn + 0.012, vol * 0.85, bright);
   if (perfect) bell(tones[sh.level] + 12, tn + 0.02, vol * 0.25);
   if (slam) bell(tones[sh.level] - 12, tn, vol * 0.9, 0.3);
@@ -553,12 +675,15 @@ function hitShape(sh, sx, shH) {
 
   p.vy = (BOUNCE_V + Math.min(p.chain, 6) * CHAIN_BOOST) * (perfect ? PERFECT_BOUNCE : 1) * (slam ? SLAM_BOUNCE : 1);
   p.boost = HOLD_TIME;
-  if (sh.kind === 'hold') {
-    // ride the held note until its beat is over (or until you jump off)
-    const end = Math.max(wt + 0.15, sh.t + sh.len);
-    p.ride = { sh, start: wt, t1: wt, end, h: shH, voice: hum(tones[sh.level], tn, end - wt, vol * 0.8) };
+  if (sh.len) {
+    // ride the held note or wave until it is over (or until you jump off)
+    const end = Math.max(wt + 0.15, sh.t + sh.len), n = tones[sh.level];
+    // a throwing wave glides toward the note it throws you to
+    const to = sh.exit !== 'flat' && sh.to != null ? tones[sh.to] : n;
+    const voice = sh.kind === 'wave' ? waveHum(n, tn, end - wt, vol * 0.8, sh, Math.max(0, wt - sh.t), (to - n) * 100) : hum(n, tn, end - wt, vol * 0.8);
+    p.ride = { sh, start: wt, t1: wt, end, h: shH, voice };
     trails.push(p.ride);
-    p.vy = 0; p.boost = 0; p.h = shH - PLAYER_H / 2;
+    p.vy = 0; p.boost = 0; p.h = shH + (sh.kind === 'wave' ? waveOff(sh, wt - sh.t) : 0) - PLAYER_H / 2;
   }
 
   hitStop = HITSTOP * (perfect || slam ? 1.5 : 1);
@@ -582,10 +707,14 @@ function endRide(full) {
     g.setTargetAtTime(0, now, 0.06);
   }
   p.vy = BOUNCE_V + Math.min(p.chain, 6) * CHAIN_BOOST; p.boost = HOLD_TIME; p.airJump = true; p.sq = 1.2;
+  const wave = r.sh.kind === 'wave';
+  // throws are fixed (no hold boost), so the note placed on their path is always caught
+  if (full && wave && r.sh.exit === 'up') { p.vy = WAVE_UP_V; p.boost = 0; p.sq = 1.35; }
+  if (full && wave && r.sh.exit === 'down') { p.vy = -WAVE_DOWN_V; p.boost = 0; p.sq = 1.3; }
   if (full) {
-    const gained = 10 * p.chain;
+    const gained = (wave ? 15 : 10) * p.chain;
     score += gained;
-    pop(PX, p.h + 70, 'held +' + gained, shapeCol(r.sh.level, 1));
+    pop(PX, p.h + 70, (wave ? 'wave +' : 'held +') + gained, shapeCol(r.sh.level, 1));
   }
   burst(PX, p.h + PLAYER_H / 2, 8, shapeCol(r.sh.level, 1), 120);
 }
@@ -658,6 +787,7 @@ function update(dt) {
   };
   if (p.ride) {
     p.ride.t1 = wt;
+    if (p.ride.sh.kind === 'wave') p.h = p.ride.h + waveOff(p.ride.sh, wt - p.ride.sh.t) - PLAYER_H / 2;
     const done = wt >= p.ride.end;
     if (done || pressed) {
       endRide(done); p.jumpBuf = 0;
@@ -815,9 +945,15 @@ function draw(beatPhase) {
     for (let h = 6; h < player.h; h += 9) ctx.fillRect(PX + player.dx - 0.8, sy(h) - 0.8, 1.6, 1.6);
   }
 
-  // held-note trails: the line you drew while riding a circle
+  // held-note trails: the line you drew while riding a circle (or a wave)
   for (const tr of trails) {
     const x0 = PX + (tr.start - wt) * SPEED, x1 = PX + (tr.t1 - wt) * SPEED, y = sy(tr.h);
+    if (tr.sh.kind === 'wave') {
+      const sx = PX + (tr.sh.t - wt) * SPEED;
+      waveLine(tr.sh, sx, tr.h, tr.start - tr.sh.t, tr.t1 - tr.sh.t, shapeCol(tr.sh.level, 0.55), 2);
+      dot(x0, sy(tr.h + waveOff(tr.sh, tr.start - tr.sh.t)), 2, shapeCol(tr.sh.level, 0.7));
+      continue;
+    }
     ctx.strokeStyle = shapeCol(tr.sh.level, 0.55); ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
     dot(x0, y, 2, shapeCol(tr.sh.level, 0.7));
@@ -831,8 +967,8 @@ function draw(beatPhase) {
     if (a.hit || a.ph < 1 || b.ph !== a.ph) continue;
     const bx = PX + (b.t - t) * SPEED;
     if (bx < -60) continue;
-    const startX = ax + a.len * SPEED;
-    dotted(startX, sy(shapeH(a, t)), bx, sy(shapeH(b, t)), 9, shapeCol(a.level, a.missed ? 0.08 : 0.22), a.len ? 2 : SHAPE_R, SHAPE_R);
+    const startX = ax + a.len * SPEED, ah = shapeH(a, t) + (a.kind === 'wave' ? waveOff(a, a.len) : 0);
+    dotted(startX, sy(ah), bx, sy(shapeH(b, t)), 9, shapeCol(a.level, a.missed ? 0.08 : 0.22), a.len ? 2 : SHAPE_R, SHAPE_R);
   }
 
   // shapes
@@ -867,6 +1003,11 @@ function draw(beatPhase) {
       const x1 = sx + sh.len * SPEED;
       dotted(sx, y, x1, y, 6, colFn(a * 0.5), SHAPE_R, 0);
       dot(x1, y, 2, colFn(a * 0.7));
+    }
+    if (sh.kind === 'wave') {
+      // the circle plus the wiggling line you will ride, bending where it throws you
+      waveLine(sh, sx, shH, SHAPE_R / SPEED, sh.len, colFn(a * 0.5), 1.4);
+      dot(sx + sh.len * SPEED, sy(shH + waveOff(sh, sh.len)), 2.2, colFn(a * 0.8));
     }
     if (sh.kind === 'chord') {
       const y2 = sy(shH + LEVEL_GAP);

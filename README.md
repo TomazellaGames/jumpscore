@@ -26,6 +26,7 @@ The first time you play, a short tutorial pauses mid-jump to teach the air jump 
 - **Polygons** (triangles, squares, pentagons, hexagons, octagons): single notes. Bounce off them to chain into the next one.
 - **Stacked pairs**: chords. Two notes at once, worth more points.
 - **Circles**: held notes. You ride them for a beat while the note sustains. Press to jump off early.
+- **Circles with a wavy line**: waves. You ride the line while the note bends and sweeps with it. A wave that ends straight releases you like a held note; one that bends up or down throws you that way, right into the next note.
 - **Small diamonds**: grace notes, quick low hops between phrases.
 
 ### Scoring
